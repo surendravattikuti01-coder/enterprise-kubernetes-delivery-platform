@@ -1,0 +1,285 @@
+name: Enterprise Kubernetes Delivery Pipeline
+
+on:
+  push:
+    branches: [main, develop, 'release/**']
+    paths-ignore: ['docs/**', '*.md']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      service:
+        description: 'Service to deploy (or "all")'
+        required: true
+        default: 'all'
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options: [dev, staging, prod]
+      strategy:
+        description: 'Deployment strategy'
+        required: true
+        type: choice
+        options: [rolling, canary, blue-green]
+        default: rolling
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+  HELM_VERSION: v3.13.2
+  KUBECTL_VERSION: v1.28.4
+  ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+  packages: write
+  security-events: write
+
+jobs:
+  # ──────────────────────────────────────────────────────────
+  # Phase 1: Detect Changes
+  # ──────────────────────────────────────────────────────────
+  detect-changes:
+    name: Detect Changed Services
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.filter.outputs.changes }}
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            api-gateway: ['services/api-gateway/**']
+            auth-service: ['services/auth-service/**']
+            payment-service: ['services/payment-service/**']
+            notification-service: ['services/notification-service/**']
+            analytics-service: ['services/analytics-service/**']
+
+      - name: Set Build Matrix
+        id: set-matrix
+        run: |
+          if [ "${{ github.event.inputs.service }}" == "all" ] || [ -z "${{ github.event.inputs.service }}" ]; then
+            SERVICES=$(echo '${{ steps.filter.outputs.changes }}' | jq -c '.')
+          else
+            SERVICES='["${{ github.event.inputs.service }}"]'
+          fi
+          echo "matrix={"service": ${SERVICES}}" >> $GITHUB_OUTPUT
+
+  # ──────────────────────────────────────────────────────────
+  # Phase 2: Build & Security Scan
+  # ──────────────────────────────────────────────────────────
+  build-and-scan:
+    name: Build, Scan & Push - ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    needs: [detect-changes]
+    if: ${{ needs.detect-changes.outputs.services != '[]' }}
+    strategy:
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+      fail-fast: false
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Extract Docker Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.ECR_REGISTRY }}/${{ matrix.service }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & Push (multi-platform)
+        uses: docker/build-push-action@v5
+        with:
+          context: services/${{ matrix.service }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,scope=${{ matrix.service }},mode=max
+          provenance: true
+          sbom: true
+
+      - name: Run Trivy Vulnerability Scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.ECR_REGISTRY }}/${{ matrix.service }}:sha-${{ github.sha }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+  # ──────────────────────────────────────────────────────────
+  # Phase 3: Deploy to Dev (Automatic)
+  # ──────────────────────────────────────────────────────────
+  deploy-dev:
+    name: Deploy to Dev
+    runs-on: ubuntu-latest
+    needs: [build-and-scan]
+    environment:
+      name: dev
+      url: https://dev.internal.example.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Tools
+        run: |
+          curl -LO "https://dl.k8s.io/release/${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
+          install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | DESIRED_VERSION=${{ env.HELM_VERSION }} bash
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name dev-eks-cluster --region ${{ env.AWS_REGION }}
+
+      - name: Helm Deploy (Rolling)
+        run: |
+          for service in ${{ join(fromJson(needs.detect-changes.outputs.services), ' ') }}; do
+            helm upgrade --install "${service}" ./helm/charts/"${service}" \
+              --namespace "${service}" \
+              --create-namespace \
+              --set image.repository=${{ env.ECR_REGISTRY }}/${service} \
+              --set image.tag=sha-${{ github.sha }} \
+              --set environment=dev \
+              --values ./helm/values/dev/"${service}".yaml \
+              --wait --timeout=10m \
+              --atomic \
+              --history-max=10
+          done
+
+      - name: Run Smoke Tests
+        run: |
+          kubectl run smoke-test --image=curlimages/curl:latest --rm -i --restart=Never \
+            --namespace=default -- \
+            curl -sf http://api-gateway.dev.svc.cluster.local/health
+
+  # ──────────────────────────────────────────────────────────
+  # Phase 4: Deploy to Prod (Canary → Full)
+  # ──────────────────────────────────────────────────────────
+  deploy-prod-canary:
+    name: Canary Deploy to Prod (10%)
+    runs-on: ubuntu-latest
+    needs: [deploy-dev]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: prod-canary
+      url: https://api.example.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name prod-eks-cluster --region ${{ env.AWS_REGION }}
+
+      - name: Canary Deploy (10% traffic)
+        run: |
+          helm upgrade --install api-gateway-canary ./helm/charts/api-gateway \
+            --namespace api-gateway \
+            --set image.tag=sha-${{ github.sha }} \
+            --set replicaCount=1 \
+            --set canary.enabled=true \
+            --set canary.weight=10 \
+            --values ./helm/values/prod/api-gateway.yaml \
+            --wait --timeout=5m
+
+      - name: Monitor Canary (5 min)
+        run: |
+          echo "Monitoring canary deployment for 5 minutes..."
+          sleep 300
+          ERROR_RATE=$(kubectl exec -n monitoring deployment/prometheus -- \
+            promtool query instant 'rate(http_requests_total{status=~"5..",service="api-gateway-canary"}[5m])' \
+            2>/dev/null | jq '.data.result[0].value[1]' -r || echo "0")
+          if (( $(echo "$ERROR_RATE > 0.01" | bc -l) )); then
+            echo "ERROR: Canary error rate ${ERROR_RATE} exceeds 1% threshold. Rolling back."
+            helm rollback api-gateway-canary
+            exit 1
+          fi
+          echo "Canary healthy. Error rate: ${ERROR_RATE}"
+
+  deploy-prod-full:
+    name: Full Production Deploy
+    runs-on: ubuntu-latest
+    needs: [deploy-prod-canary]
+    environment:
+      name: production
+      url: https://api.example.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name prod-eks-cluster --region ${{ env.AWS_REGION }}
+
+      - name: Full Production Deploy
+        run: |
+          for service in ${{ join(fromJson(needs.detect-changes.outputs.services), ' ') }}; do
+            helm upgrade --install "${service}" ./helm/charts/"${service}" \
+              --namespace "${service}" \
+              --set image.tag=sha-${{ github.sha }} \
+              --set environment=prod \
+              --values ./helm/values/prod/"${service}".yaml \
+              --wait --timeout=15m \
+              --atomic \
+              --history-max=5
+          done
+
+      - name: Remove Canary
+        run: helm uninstall api-gateway-canary --namespace api-gateway || true
+
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@v1.25.0
+        if: always()
+        with:
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && '✅' || '🚨' }} Production deploy ${{ job.status }} - ${{ github.sha }} by ${{ github.actor }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
